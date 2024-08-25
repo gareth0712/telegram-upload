@@ -1,7 +1,7 @@
 import datetime
 import math
 import os
-
+import re
 
 import mimetypes
 from io import FileIO, SEEK_SET
@@ -17,8 +17,12 @@ from telegram_upload.exceptions import TelegramInvalidFile, ThumbError
 from telegram_upload.utils import scantree, truncate
 from telegram_upload.video import get_video_thumb, video_metadata
 
-mimetypes.init()
+VIDEO_FILE_EXTENSIONS = [
+    "3gp", "asf", "avi", "f4v", "flv", "hevc", "m2ts", "m2v", "m4v", "mjpeg", "mkv", "mov", "mp4", "mpeg", "mpg", "mts",
+    "mxf", "ogv", "rm", "ts", "vob", "webm", "wmv", "wtv"
+]
 
+mimetypes.init()
 
 if TYPE_CHECKING:
     from telegram_upload.client import TelegramManagerClient
@@ -59,20 +63,34 @@ def get_file_attributes(file):
         if metadata is not None and not metadata.has('width') and meta_groups:
             video_meta = meta_groups[next(filter(lambda x: x.startswith('video'), meta_groups._key_list))]
         if metadata is not None:
+            if (metadata_has(metadata, 'duration')):
+                duration = metadata.get('duration').seconds
+            else:
+                duration = 0
+            if (metadata_has(metadata, 'width')):
+                width = metadata.get('width')
+            else:
+                width = 0
+            if (metadata_has(metadata, 'height')):
+                height = metadata.get('height')
+            else:
+                height = 0
             supports_streaming = isinstance(video_meta, MP4Metadata)
             attrs.append(DocumentAttributeVideo(
-                (0, metadata.get('duration').seconds)[metadata_has(metadata, 'duration')],
-                (0, video_meta.get('width'))[metadata_has(video_meta, 'width')],
-                (0, video_meta.get('height'))[metadata_has(video_meta, 'height')],
+                duration,
+                width,
+                height,
                 False,
                 supports_streaming,
             ))
+            
     return attrs
 
 
 def get_file_thumb(file):
     if get_file_mime(file) == 'video':
         return get_video_thumb(file)
+
 
 
 class UploadFilesBase:
@@ -151,9 +169,13 @@ class File(FileIO):
         self._caption = caption
 
     @property
+    def full_path(self):
+        return os.path.dirname(self.path)
+    
+    @property
     def file_name(self):
         return os.path.basename(self.path)
-
+    
     @property
     def file_size(self):
         return os.path.getsize(self.path)
@@ -162,9 +184,51 @@ class File(FileIO):
     def short_name(self):
         return '.'.join(self.file_name.split('.')[:-1])
 
+    # get the last directory from dirname
+    @property
+    def directory(self):
+        return os.path.basename(os.path.dirname(self.path))
+    
     @property
     def is_custom_thumbnail(self):
         return self._thumbnail is not False and self._thumbnail is not None
+
+    @property
+    def get_tags(self):
+        tags = []
+        for tag in self.directory.split('-'):
+            tag = re.sub(r'\d\.','', tag)
+            tags.append(f'#{tag} {tag}')
+        return tags
+    
+    @property
+    def file_extension(self):
+        return self.file_name.split('.')[-1]
+
+    @property
+    def get_txt_filepath(self):
+        # return the full path including the filename with txt extension
+        return os.path.join(self.full_path, self.short_name + '.txt')
+    
+    @property
+    def get_txt_file_content(self):
+        filepath = self.get_txt_filepath
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                return f.read()
+        return None
+
+    @property
+    def txt_with_media_file(self):
+        # Contain a media of the same name as txt file
+        # Go through a loop for extensions in VIDEO_FILE_EXTENSIONS to see if a media file of the same name exists 
+        for ext in VIDEO_FILE_EXTENSIONS:
+            filename_with_path = os.path.join(self.full_path, self.short_name)
+            media_file = filename_with_path + '.' + ext
+            media_file_capital = filename_with_path + '.' + ext.upper()
+            if os.path.exists(media_file) or os.path.exists(media_file_capital):
+                return media_file
+        return None
 
     @property
     def file_caption(self) -> str:
@@ -175,8 +239,13 @@ class File(FileIO):
         if self._caption is not None:
             formatter = CaptionFormatter()
             caption = formatter.format(self._caption, file=FilePath(self.path), now=datetime.datetime.now())
+        elif self.get_txt_file_content is not None:
+            caption = self.get_txt_file_content
         else:
             caption = self.short_name
+        tags = self.get_tags
+        # add the tags  to the caption with newline
+        caption += '\n\n' + ' '.join(tags)
         return truncate(caption, self.client.max_caption_length)
 
     def get_thumbnail(self):

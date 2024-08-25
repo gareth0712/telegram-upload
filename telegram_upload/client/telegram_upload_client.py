@@ -37,25 +37,99 @@ class TelegramUploadClient(TelegramClient):
             self.forward_messages(destination, [message])
 
     async def _send_album_media(self, entity, media):
-        entity = await self.get_input_entity(entity)
-        request = functions.messages.SendMultiMediaRequest(
-            entity, multi_media=media, silent=None, schedule_date=None, clear_draft=None
-        )
-        result = await self(request)
+        try:
+            # Should also handle FloodWaitError here
+            entity = await self.get_input_entity(entity)
+            request = functions.messages.SendMultiMediaRequest(
+                entity, multi_media=media, silent=None, schedule_date=None, clear_draft=None
+            )
+            result = await self(request)
 
-        random_ids = [m.random_id for m in media]
-        return self._get_response_message(random_ids, result, entity)
+            random_ids = [m.random_id for m in media]
+            return self._get_response_message(random_ids, result, entity)
+        except FloodWaitError as e:
+            click.echo(f'{e}. Waiting for {e.seconds} seconds.', err=True)
+            time.sleep(e.seconds)
+            await self._send_album_media(entity, media)
+
+    def dynamic_grouper(entity, file_list):
+        groups = []
+        current_group = []
+        current_suffix = None
+        i = 0
+
+        for item in file_list:
+            parts = item.short_name.split(' - ')
+            # Captions check
+            if len(parts) == 2:
+                num, suffix = parts
+            else:
+                num = parts[0]
+                suffix = None
+            
+            # a) First item of a new group
+            if len(current_group) == 0:
+                # suffix is not None -> update current_suffix
+                if suffix != None:
+                    current_suffix = suffix
+                current_group.append(item)
+            # b) Current group has items
+            else:
+                # b.1) current_suffix is None
+                if current_suffix == None:
+                    # b.1.1) suffix is None -> append to current_group until 
+                    # - it reaches 10; or
+                    # - suffix is not None
+                    if suffix == None:
+                        current_group.append(item)
+                    # b.1.2) suffix is not None -> end the current_group and append to new group
+                    else:
+                        groups.append(current_group)
+                        current_group = [item]
+                        current_suffix = suffix
+                # b.2) current_suffix is not None
+                else:
+                    # b.2.1) suffix is None -> end the current_group and append to new group
+                    if suffix == None:
+                        groups.append(current_group)
+                        current_group = [item]
+                        current_suffix = None
+                    # b.2.2) suffix is not None
+                    else:
+                        # b.2.2.1) current_suffix is equal to suffix -> append to current_group
+                        if current_suffix == suffix:
+                            current_group.append(item)
+                        # b.2.2.2) current_suffix is not equal to suffix -> end the current_group and append to new group
+                        else:
+                            groups.append(current_group)
+                            current_group = [item]
+                            current_suffix = suffix
+                
+            if len(current_group) == 10:
+                groups.append(current_group)
+                current_group = []
+                current_suffix = None
+        
+        if len(current_group) > 0:
+            groups.append(current_group)
+
+        return groups
 
     def send_files_as_album(self, entity, files, delete_on_success=False, print_file_id=False,
                             forward=()):
-        for files_group in grouper(ALBUM_FILES, files):
-            media = self.send_files(entity, files_group, delete_on_success, print_file_id, forward, send_as_media=True)
+        groups = self.dynamic_grouper(files)
+        print(groups)
+        # for files_group in grouper(ALBUM_FILES, files):
+        for files_group in groups:
+            media = self.send_files(entity, files_group, delete_on_success, print_file_id, forward, send_as_media=True, send_as_album=True)
             async_to_sync(self._send_album_media(entity, media))
 
-    def _send_file_message(self, entity, file, thumb, progress):
+    def _send_file_message(self, entity, file, thumb, progress, include_caption=True):
+        # print('going through send_file_message...')
+        caption = file.file_caption if include_caption else None
         message = self.send_file(entity, file, thumb=thumb,
                                  file_size=file.file_size if isinstance(file, File) else None,
-                                 caption=file.file_caption, force_document=file.force_file,
+                                 caption=caption, force_document=file.force_file,
                                  progress_callback=progress, attributes=file.file_attributes)
         if hasattr(message.media, 'document') and file.file_size != message.media.document.size:
             raise TelegramUploadDataLoss(
@@ -63,7 +137,8 @@ class TelegramUploadClient(TelegramClient):
                     message.media.document.size, file.file_size))
         return message
 
-    async def _send_media(self, entity, file: File, progress):
+    async def _send_media(self, entity, file: File, progress, thumb, include_caption=True):
+        print('going through _send_media with caption', include_caption)
         entity = await self.get_input_entity(entity)
         supports_streaming = False  # TODO
         fh, fm, _ = await self._file_to_media(
@@ -75,6 +150,8 @@ class TelegramUploadClient(TelegramClient):
 
             fm = utils.get_input_media(r.photo)
         elif isinstance(fm, types.InputMediaUploadedDocument):
+            thumbnail_file = await self.upload_file(thumb)
+            fm.thumb = thumbnail_file
             r = await self(functions.messages.UploadMediaRequest(
                 entity, media=fm
             ))
@@ -82,15 +159,17 @@ class TelegramUploadClient(TelegramClient):
             fm = utils.get_input_media(
                 r.document, supports_streaming=supports_streaming)
 
+        caption = file.file_caption if include_caption else ""
+        print('caption is: ', caption)
         return types.InputSingleMedia(
             fm,
-            message=file.short_name,
+            message=caption,
             entities=None,
             # random_id is autogenerated
         )
 
     def send_one_file(self, entity, file: File, send_as_media: bool = False, thumb: Optional[str] = None,
-                      retries=RETRIES):
+                      retries=RETRIES, include_caption=True):
         message = None
         progress, bar = get_progress_bar('Uploading', file.file_name, file.file_size)
 
@@ -98,32 +177,51 @@ class TelegramUploadClient(TelegramClient):
             try:
                 # TODO: remove distinction?
                 if send_as_media:
-                    message = async_to_sync(self._send_media(entity, file, progress))
+                    print('send_one_file... include_caption is', include_caption)
+                    message = async_to_sync(self._send_media(entity, file, progress, thumb, include_caption))
                 else:
-                    message = self._send_file_message(entity, file, thumb, progress)
+                    # Send file message is the ordinary way
+                    message = self._send_file_message(entity, file, thumb, progress, include_caption)
             finally:
                 bar.render_finish()
         except FloodWaitError as e:
             click.echo(f'{e}. Waiting for {e.seconds} seconds.', err=True)
             time.sleep(e.seconds)
-            message = self.send_one_file(entity, file, send_as_media, thumb, retries)
+            message = self.send_one_file(entity, file, send_as_media, thumb, retries, include_caption)
         except RPCError as e:
             if retries > 0:
                 click.echo(f'The file "{file.file_name}" could not be uploaded: {e}. Retrying...', err=True)
-                message = self.send_one_file(entity, file, send_as_media, thumb, retries - 1)
+                message = self.send_one_file(entity, file, send_as_media, thumb, retries - 1, include_caption)
             else:
                 click.echo(f'The file "{file.file_name}" could not be uploaded: {e}. It will not be retried.', err=True)
         return message
 
     def send_files(self, entity, files: Iterable[File], delete_on_success=False, print_file_id=False,
-                   forward=(), send_as_media: bool = False):
+                   forward=(), send_as_media: bool = False, send_as_album:bool = False):
         has_files = False
         messages = []
+        i = 0
+        include_caption = True
+        # Each file is File class instance
         for file in files:
+            # Current file is txt
             has_files = True
+            if (file.file_extension == 'txt'):
+                # Skip if there is a media file of the same filename
+                # the txt file will be used as caption
+                if (file.txt_with_media_file): continue
+                # Send the txt file content as message
+                message = self.send_message(entity, file.get_txt_file_content)
+                # TODO: figure out how it goes to the next file and what is message doing
+                messages.append(message)
+                continue
             thumb = file.get_thumbnail()
             try:
-                message = self.send_one_file(entity, file, send_as_media, thumb=thumb)
+                if send_as_album and i != 0:
+                    include_caption = False
+                    print('sending as album... include_caption is turned ', include_caption)
+                message = self.send_one_file(entity, file, send_as_media, thumb=thumb, include_caption=include_caption)
+                i += 1
             finally:
                 if thumb and not file.is_custom_thumbnail and os.path.lexists(thumb):
                     os.remove(thumb)
@@ -378,7 +476,7 @@ class TelegramUploadClient(TelegramClient):
         """
         if self.parallel_upload_blocks > 1:
             self.parallel_upload_blocks -= 1
-            self.loop.create_task(self.upload_semaphore.acquire())
+            self.loop.create_task(seluf.upload_semaphore.acquire())
 
     async def reconnect(self):
         """
