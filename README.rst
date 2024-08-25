@@ -181,3 +181,9 @@ This project developed by `Nekmo <https://github.com/Nekmo>`_ & `collaborators <
 `Telethon <https://github.com/LonamiWebs/Telethon>`_, the library used as a Telegram client.
 
 Telegram-upload is licensed under the `MIT license <https://github.com/Nekmo/telegram-upload/blob/master/LICENSE>`_.
+
+
+💡 Examples for local use
+===========
+
+python3 management.py upload --album --directories recursive --sort --to <channel_url> <path_to_upload>
