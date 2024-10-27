@@ -63,6 +63,8 @@ class TelegramUploadClient(TelegramClient):
             # Captions check
             if len(parts) == 2:
                 num, suffix = parts
+                # Remove trailing dots
+                suffix = suffix.rstrip('.')
             else:
                 num = parts[0]
                 suffix = None
